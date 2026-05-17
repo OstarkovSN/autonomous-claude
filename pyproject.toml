@@ -3,6 +3,8 @@ name = "autonomous-claude"
 version = "0.1.0"
 description = "PTY wrapper around `claude` exposing a Unix-socket control channel for self-compact/clear/exit."
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = ["ptyprocess>=0.7"]
 
 [project.scripts]

@@ -188,3 +188,7 @@ Tests do not exercise a real `claude` binary; the integration tests spawn
   buffer handles ordering.
 - No credential storage in env vars or protocol.
 - Not a daemon — one wrapper process per session.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
