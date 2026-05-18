@@ -23,9 +23,10 @@ venv/
 env/
 .python-version
 
-# Editor / OS
+# Editor / OS / tooling
 .vscode/
 .idea/
+.serena/
 *.swp
 *.swo
 .DS_Store
