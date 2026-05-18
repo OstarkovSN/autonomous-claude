@@ -46,6 +46,12 @@ SEND_KEYS_ALLOWED: frozenset[int] = frozenset(
 
 MAX_REQUEST_BYTES = 64 * 1024
 
+# After /compact, Claude Code returns to an idle prompt and waits for input —
+# it does not auto-resume the prior task. We queue a one-line nudge that
+# lands in the input buffer; the TUI processes it as the next user turn once
+# compaction finishes. Plain text (no leading slash) so no autocomplete fires.
+POST_COMPACT_NUDGE = b"Context was just compacted. Resume your previous task.\r"
+
 
 # --- low-level write helper -------------------------------------------------
 
@@ -98,15 +104,31 @@ def translate_command(payload: dict[str, Any]) -> bytes:
     # is "interrupt current generation" — it would abort the very turn that
     # fired this socket call. Keystrokes written while Claude is mid-turn
     # queue cleanly as the next user message, which is what we want.
+    #
+    # After /compact runs, the TUI returns to an idle input prompt — Claude
+    # does NOT auto-resume. So every compact translation appends a follow-up
+    # nudge that gets typed into the input buffer; once the TUI returns from
+    # compaction it processes the queued bytes as the next user turn.
     if cmd == "compact":
         instructions = payload.get("instructions")
+        if instructions is not None:
+            if not isinstance(instructions, str):
+                raise ValueError("instructions must be a string")
+            if not validate_send_keys(instructions):
+                raise ValueError("instructions contains disallowed bytes")
         if instructions is None:
-            return b"/compact\r"
-        if not isinstance(instructions, str):
-            raise ValueError("instructions must be a string")
-        if not validate_send_keys(instructions):
-            raise ValueError("instructions contains disallowed bytes")
-        return b"/compact " + instructions.encode("utf-8") + b"\r"
+            compact_seq = b"/compact\r"
+        else:
+            # Wrap /compact + args in bracketed paste (ESC[200~ … ESC[201~).
+            # Without it, typing `/compact ` character-by-character lets the
+            # TUI's slash-command autocomplete eat the space as "confirm &
+            # submit," firing bare /compact and dumping the instructions into
+            # the next input as plain text (where \r becomes a newline, not a
+            # submit). Bracketed paste bypasses the autocomplete state machine
+            # — the TUI treats the whole thing as one pasted line.
+            body = b"/compact " + instructions.encode("utf-8")
+            compact_seq = b"\x1b[200~" + body + b"\x1b[201~\r"
+        return compact_seq + POST_COMPACT_NUDGE
 
     if cmd == "clear":
         return b"/clear\r"

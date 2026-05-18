@@ -6,12 +6,48 @@ from autonomous_claude import translate_command
 
 
 def test_compact_no_instructions() -> None:
-    assert translate_command({"cmd": "compact"}) == b"/compact\r"
+    from autonomous_claude import POST_COMPACT_NUDGE
+
+    out = translate_command({"cmd": "compact"})
+    assert out.startswith(b"/compact\r")
+    assert out.endswith(POST_COMPACT_NUDGE)
+    # Exactly: slash command + nudge, nothing else.
+    assert out == b"/compact\r" + POST_COMPACT_NUDGE
 
 
-def test_compact_with_instructions() -> None:
+def test_compact_with_instructions_uses_bracketed_paste() -> None:
+    from autonomous_claude import POST_COMPACT_NUDGE
+
     out = translate_command({"cmd": "compact", "instructions": "keep API contract"})
-    assert out == b"/compact keep API contract\r"
+    # Bracketed paste wraps the /compact + args, then \r submits, then the
+    # nudge text gets queued for the next user turn.
+    expected = (
+        b"\x1b[200~/compact keep API contract\x1b[201~\r" + POST_COMPACT_NUDGE
+    )
+    assert out == expected
+
+
+def test_compact_nudge_is_appended_in_both_forms() -> None:
+    """Regression: post-compact Claude waits idle without a follow-up nudge."""
+    from autonomous_claude import POST_COMPACT_NUDGE
+
+    bare = translate_command({"cmd": "compact"})
+    with_args = translate_command({"cmd": "compact", "instructions": "x"})
+    assert bare.endswith(POST_COMPACT_NUDGE)
+    assert with_args.endswith(POST_COMPACT_NUDGE)
+
+
+def test_compact_with_instructions_not_typed_charwise() -> None:
+    """Regression: typing `/compact <args>` char-by-char makes the TUI's
+    autocomplete eat the space as confirm-and-submit, splitting the args
+    off into a new input. Bracketed paste must wrap them."""
+    out = translate_command({"cmd": "compact", "instructions": "focus"})
+    assert b"\x1b[200~" in out
+    assert b"\x1b[201~" in out
+    # The slash-command body must live INSIDE the paste brackets.
+    paste_start = out.index(b"\x1b[200~") + len(b"\x1b[200~")
+    paste_end = out.index(b"\x1b[201~")
+    assert out[paste_start:paste_end] == b"/compact focus"
 
 
 def test_clear() -> None:

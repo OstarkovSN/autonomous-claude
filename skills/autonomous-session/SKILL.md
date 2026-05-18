@@ -37,12 +37,37 @@ Only at genuine task-completion moments:
 context feel cleaner. You are destroying working memory the user is
 depending on.
 
+## Optional: Compact Reminder Hook
+
+A lightweight hook reminds you every ~25 messages to consider compacting when tasks complete. Useful for autonomous work where context can accumulate across unrelated tasks.
+
+**Enable in settings.json:**
+```json
+{
+  "hooks": {
+    "post_turn_hook": "bash ~/.claude/hooks/autonomous-compact-reminder.sh"
+  }
+}
+```
+
+**Customize frequency:**
+```bash
+export COMPACT_REMINDER_THRESHOLD=40  # remind every 40 messages instead of 25
+```
+
+The hook only triggers inside `autonomous-claude` sessions (no-op in regular Claude Code). See `~/.claude/hooks/AUTONOMOUS-COMPACT-REMINDER.md` for full details.
+
 ## How it actually fires
 
 The controller writes the slash-command keystrokes into Claude Code's input
 field. While you are mid-turn — which you always are when calling this —
 those keystrokes are **queued**. They run as the *next* user turn, after
-your current turn completes. Practical implications:
+your current turn completes. For `compact`, the wrapper also queues a
+follow-up nudge (`Context was just compacted. Resume your previous task.`)
+that fires automatically once compaction finishes — so post-compact "you"
+gets an unconditional resume signal rather than sitting idle.
+
+Practical implications:
 
 - Exit code 0 means "queued," not "compacted." You do **not** have a fresh
   context yet. Anything you do after this call still uses the old context
@@ -51,6 +76,9 @@ your current turn completes. Practical implications:
   Anything you generate after the controller call is wasted work.
 - Never call `compact` and then try to start more work in the same response.
   Treat the controller call as the last thing you do.
+- Post-compact "you" will receive the resume nudge as the first user
+  message. The work the user originally asked for should still be findable
+  in the compacted summary — pick up where you left off.
 
 ## Required workflow
 

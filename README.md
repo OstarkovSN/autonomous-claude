@@ -89,16 +89,32 @@ One JSON request per connection. Replies are one line, `{"ok": true}` or
 
 Keystroke translation:
 
-| `cmd`        | Bytes written to PTY master                          |
-| ------------ | ---------------------------------------------------- |
-| `compact`    | `ESC /compact\r` (or `ESC /compact <instructions>\r`)|
-| `clear`      | `ESC /clear\r`                                       |
-| `exit`       | `ESC /exit\r`                                        |
-| `send_keys`  | `data.encode("utf-8")`                               |
+| `cmd`                          | Bytes written to PTY master                                                              |
+| ------------------------------ | ---------------------------------------------------------------------------------------- |
+| `compact` (no args)            | `/compact\r` + post-compact nudge + `\r`                                                 |
+| `compact` (with instructions)  | `ESC[200~/compact <args>ESC[201~\r` + post-compact nudge + `\r`                          |
+| `clear`                        | `/clear\r`                                                                               |
+| `exit`                         | `/exit\r`                                                                                |
+| `send_keys`                    | `data.encode("utf-8")`                                                                   |
 
-The leading `ESC` dismisses any open autocomplete menu before the slash command
-runs. The trailing `\r` (never `\n`) is what the TUI's input field treats as
-submit.
+Two subtleties worth knowing:
+
+- **Bracketed paste for `/compact <args>`.** Typing the slash command
+  character-by-character lets the TUI's autocomplete intercept the space
+  after `compact` as "confirm & submit," which fires bare `/compact` and
+  dumps the instructions into the next input as plain text. Wrapping the
+  whole line in `ESC[200~ … ESC[201~` (bracketed paste) bypasses
+  autocomplete — the TUI receives one atomic paste event and parses the
+  slash command at submission.
+- **Post-compact nudge.** After `/compact` runs, Claude Code returns to an
+  idle prompt and waits for the next user message. The wrapper queues a
+  short follow-up (`Context was just compacted. Resume your previous task.`)
+  into the input buffer; the TUI processes it once compaction finishes,
+  giving Claude an unconditional resume signal.
+
+The trailing `\r` (never `\n`) is what the TUI's input field treats as
+submit. **No** leading `ESC` — that's the "interrupt generation" hotkey
+in Claude Code's TUI, not "close autocomplete."
 
 `send_keys.data` is restricted to **printable ASCII + `\r` + `\x1b`**. That
 allows CSI sequences (`\x1b[A` etc.) but blocks Ctrl-C, NUL, tab, and `\n`.
