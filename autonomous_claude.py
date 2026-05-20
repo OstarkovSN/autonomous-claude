@@ -47,11 +47,22 @@ SEND_KEYS_ALLOWED: frozenset[int] = frozenset(
 
 MAX_REQUEST_BYTES = 64 * 1024
 
-# After /compact, Claude Code returns to an idle prompt and waits for input —
-# it does not auto-resume the prior task. We queue a one-line nudge that
-# lands in the input buffer; the TUI processes it as the next user turn once
-# compaction finishes. Plain text (no leading slash) so no autocomplete fires.
+# After /compact, Claude Code returns to an idle prompt and waits for input.
+# Empirically: keystrokes typed DURING /compact are discarded, not queued for
+# the next turn (unlike during normal assistant generation). So the resume
+# nudge must be fired *after* compaction is plausibly complete — we use a
+# wall-clock delay that gets scheduled by the dispatcher and drained by the
+# main loop. Plain text (no leading slash) so no autocomplete interference.
 POST_COMPACT_NUDGE = b"Context was just compacted. Resume your previous task.\r"
+
+# Seconds to wait after submitting /compact before firing POST_COMPACT_NUDGE.
+# Compaction time varies with context size (small sessions: a few seconds;
+# near-full sessions: 30+ seconds). 20 s is a reasonable midpoint — too short
+# risks the nudge being discarded mid-compaction, too long leaves the user
+# staring at an idle screen. Overridable via env var for tuning.
+COMPACT_RESUME_DELAY_S = float(
+    os.environ.get("AUTONOMOUS_CLAUDE_RESUME_DELAY", "20")
+)
 
 # When `translate_command` returns multiple chunks, the dispatcher sleeps this
 # long between them. The TUI's stdin reader gets one input event per chunk
@@ -133,7 +144,8 @@ def translate_command(payload: dict[str, Any]) -> list[bytes]:
                 raise ValueError("instructions contains disallowed bytes")
         if instructions is None:
             # Bare /compact — no paste mode involved, single write is fine.
-            return [b"/compact\r", POST_COMPACT_NUDGE]
+            # POST_COMPACT_NUDGE is scheduled separately by get_delayed_writes.
+            return [b"/compact\r"]
         # Wrap /compact + args in bracketed paste (ESC[200~ … ESC[201~).
         # Without it, typing `/compact ` character-by-character lets the
         # TUI's slash-command autocomplete eat the space as "confirm &
@@ -147,11 +159,7 @@ def translate_command(payload: dict[str, Any]) -> list[bytes]:
         # paste and the \r in one input event, and the \r ends up as a
         # newline character in the input field instead of a submit.
         body = b"/compact " + instructions.encode("utf-8")
-        return [
-            b"\x1b[200~" + body + b"\x1b[201~",
-            b"\r",
-            POST_COMPACT_NUDGE,
-        ]
+        return [b"\x1b[200~" + body + b"\x1b[201~", b"\r"]
 
     if cmd == "clear":
         return [b"/clear\r"]
@@ -166,6 +174,19 @@ def translate_command(payload: dict[str, Any]) -> list[bytes]:
     if not validate_send_keys(data):
         raise ValueError("data contains disallowed bytes")
     return [data.encode("utf-8")]
+
+
+def get_delayed_writes(payload: dict[str, Any]) -> list[tuple[float, bytes]]:
+    """Return writes that should fire some number of seconds AFTER the
+    immediate chunks. Used to schedule the post-compact resume nudge, which
+    has to land after /compact actually completes (keystrokes during
+    compaction are discarded, not queued).
+
+    Returns: list of (delay_seconds_from_now, bytes_to_write).
+    """
+    if payload.get("cmd") == "compact":
+        return [(COMPACT_RESUME_DELAY_S, POST_COMPACT_NUDGE)]
+    return []
 
 
 # --- socket lifecycle helpers -----------------------------------------------
@@ -221,6 +242,9 @@ class Wrapper:
         self.client_buffers: dict[int, bytes] = {}
         self._stdin_termios: list[Any] | None = None
         self._winch_pending = False
+        # Heap of (deadline_monotonic, bytes) for writes scheduled to fire
+        # later. The main loop drains entries whose deadline has passed.
+        self._pending_writes: list[tuple[float, bytes]] = []
 
     # -- setup / teardown --
 
@@ -382,7 +406,30 @@ class Wrapper:
                     },
                 )
                 return
+        # Schedule any delayed follow-ups (e.g. the post-compact resume nudge).
+        now = time.monotonic()
+        for delay_s, payload_bytes in get_delayed_writes(payload):
+            self._pending_writes.append((now + delay_s, payload_bytes))
         self._reply(conn, {"ok": True})
+
+    def _drain_pending_writes(self) -> None:
+        """Fire any scheduled writes whose deadline has passed."""
+        if not self._pending_writes or self.child is None:
+            return
+        if not self.child.isalive():
+            self._pending_writes.clear()
+            return
+        now = time.monotonic()
+        # Partition: fire-now vs keep.
+        fire_now = [b for d, b in self._pending_writes if d <= now]
+        self._pending_writes = [
+            (d, b) for d, b in self._pending_writes if d > now
+        ]
+        for buf in fire_now:
+            try:
+                write_all(self.child.fd, buf)
+            except OSError as exc:
+                log.warning("delayed write failed: %s", exc)
 
     # -- main loop --
 
@@ -431,6 +478,8 @@ class Wrapper:
                 self._winch_pending = False
                 self._push_winsize()
 
+            self._drain_pending_writes()
+
             if not self.child.isalive():
                 # Drain any remaining output before exit.
                 try:
@@ -453,8 +502,14 @@ class Wrapper:
             rlist = [master_fd, server_fd, *self.clients.keys()]
             if stdin_open:
                 rlist.append(stdin_fd)
+            # Cap select timeout so we don't oversleep a pending delayed write.
+            timeout = 0.5
+            if self._pending_writes:
+                now = time.monotonic()
+                next_deadline = min(d for d, _ in self._pending_writes)
+                timeout = max(0.0, min(timeout, next_deadline - now))
             try:
-                ready, _, _ = select.select(rlist, [], [], 0.5)
+                ready, _, _ = select.select(rlist, [], [], timeout)
             except InterruptedError:
                 continue
             except OSError as exc:

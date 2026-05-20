@@ -116,6 +116,72 @@ def test_send_keys_roundtrip_through_cat(tmp_path: Path) -> None:
         assert not Path(f"/tmp/autonomous-claude-{wrapper.pid}.sock").exists()
 
 
+@pytest.mark.skipif(shutil.which("cat") is None, reason="cat not on PATH")
+def test_compact_resume_nudge_fires_after_delay(tmp_path: Path) -> None:
+    """End-to-end: send a compact command, verify the resume nudge keystrokes
+    arrive at the child *after* the configured delay. Uses a short delay via
+    the AUTONOMOUS_CLAUDE_RESUME_DELAY env var so the test stays fast."""
+    env = os.environ.copy()
+    env["AUTONOMOUS_CLAUDE_BINARY"] = "cat"
+    env["AUTONOMOUS_CLAUDE_RESUME_DELAY"] = "1.0"  # 1s instead of 20s
+    env["HOME"] = str(tmp_path)
+    wrapper = PtyProcess.spawn(
+        [sys.executable, str(ROOT / "autonomous_claude.py")],
+        env=env,
+        dimensions=(24, 80),
+    )
+    try:
+        sock_path = f"/tmp/autonomous-claude-{wrapper.pid}.sock"
+        _wait_for_sock(sock_path)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(5.0)
+        client.connect(sock_path)
+        client.sendall(b'{"cmd":"compact"}\n')
+        # Read OK reply.
+        reply_buf = b""
+        while b"\n" not in reply_buf:
+            chunk = client.recv(256)
+            if not chunk:
+                break
+            reply_buf += chunk
+        client.close()
+        assert json.loads(reply_buf.decode())["ok"] is True
+
+        # /compact\r arrives at cat immediately. The resume nudge should
+        # arrive ~1 second later. Drain output and look for both, with
+        # timestamps.
+        t0 = time.monotonic()
+        buf = b""
+        compact_seen_at: float | None = None
+        nudge_seen_at: float | None = None
+        deadline = t0 + 4.0
+        while time.monotonic() < deadline:
+            try:
+                chunk = wrapper.read(4096)
+            except EOFError:
+                break
+            if chunk:
+                buf += chunk
+                if compact_seen_at is None and b"/compact" in buf:
+                    compact_seen_at = time.monotonic() - t0
+                if nudge_seen_at is None and b"Context was just compacted" in buf:
+                    nudge_seen_at = time.monotonic() - t0
+                    break
+            else:
+                time.sleep(0.05)
+
+        assert compact_seen_at is not None, f"never saw /compact in: {buf!r}"
+        assert nudge_seen_at is not None, f"never saw resume nudge in: {buf!r}"
+        # Nudge must arrive AFTER /compact, and at least ~0.8s later (we set
+        # delay=1.0, leave slack for scheduling jitter).
+        assert nudge_seen_at - compact_seen_at >= 0.8, (
+            f"nudge fired too soon: compact at {compact_seen_at:.2f}s, "
+            f"nudge at {nudge_seen_at:.2f}s"
+        )
+    finally:
+        _shutdown(wrapper)
+
+
 @pytest.mark.skipif(shutil.which("sh") is None, reason="sh not on PATH")
 def test_signal_exit_code_propagated(tmp_path: Path) -> None:
     """Regression: bug #2 — wrapper used to return 0 for signal-killed child.

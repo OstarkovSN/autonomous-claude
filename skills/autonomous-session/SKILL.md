@@ -62,10 +62,12 @@ The hook only triggers inside `autonomous-claude` sessions (no-op in regular Cla
 The controller writes the slash-command keystrokes into Claude Code's input
 field. While you are mid-turn — which you always are when calling this —
 those keystrokes are **queued**. They run as the *next* user turn, after
-your current turn completes. For `compact`, the wrapper also queues a
+your current turn completes. For `compact`, the wrapper *also* schedules a
 follow-up nudge (`Context was just compacted. Resume your previous task.`)
-that fires automatically once compaction finishes — so post-compact "you"
-gets an unconditional resume signal rather than sitting idle.
+to fire ~20 s after the `/compact` submission — keystrokes typed *during*
+compaction are discarded by Claude Code (unlike during normal generation),
+so the nudge has to arrive after compaction completes. Default delay is
+20 s; tunable via `AUTONOMOUS_CLAUDE_RESUME_DELAY=<seconds>` on the wrapper.
 
 Practical implications:
 

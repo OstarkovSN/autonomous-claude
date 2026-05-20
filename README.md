@@ -106,11 +106,14 @@ Two subtleties worth knowing:
   whole line in `ESC[200~ … ESC[201~` (bracketed paste) bypasses
   autocomplete — the TUI receives one atomic paste event and parses the
   slash command at submission.
-- **Post-compact nudge.** After `/compact` runs, Claude Code returns to an
-  idle prompt and waits for the next user message. The wrapper queues a
-  short follow-up (`Context was just compacted. Resume your previous task.`)
-  into the input buffer; the TUI processes it once compaction finishes,
-  giving Claude an unconditional resume signal.
+- **Post-compact nudge (scheduled, not streamed).** After `/compact` runs,
+  Claude Code returns to an idle prompt and waits. Keystrokes typed
+  *during* compaction are discarded (not queued like during normal
+  generation), so the wrapper *schedules* a follow-up nudge to fire some
+  seconds after the `/compact` submission — `Context was just compacted.
+  Resume your previous task.\r` arrives as a delayed, separate write once
+  compaction is plausibly complete. Default delay 20 s, overridable via
+  `AUTONOMOUS_CLAUDE_RESUME_DELAY=<seconds>` in the wrapper's environment.
 
 The trailing `\r` (never `\n`) is what the TUI's input field treats as
 submit. **No** leading `ESC` — that's the "interrupt generation" hotkey

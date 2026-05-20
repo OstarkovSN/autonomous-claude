@@ -6,36 +6,58 @@ from autonomous_claude import translate_command
 
 
 def test_compact_no_instructions() -> None:
-    from autonomous_claude import POST_COMPACT_NUDGE
-
+    # Immediate chunks: just the submit. The nudge is now SCHEDULED, not
+    # appended to the keystroke stream, because keystrokes typed during
+    # compaction are discarded by Claude Code (unlike during normal
+    # generation, where they queue as the next user turn).
     out = translate_command({"cmd": "compact"})
-    assert out == [b"/compact\r", POST_COMPACT_NUDGE]
+    assert out == [b"/compact\r"]
 
 
 def test_compact_with_instructions_uses_bracketed_paste() -> None:
-    from autonomous_claude import POST_COMPACT_NUDGE
-
     out = translate_command({"cmd": "compact", "instructions": "keep API contract"})
-    # Three chunks, written with a delay between each:
+    # Two immediate chunks, written with a delay between:
     #   1. bracketed-paste-wrapped /compact + args (no trailing \r)
     #   2. the submit \r — must be a separate write so Ink processes it
     #      as a distinct input event, not merged into the paste
-    #   3. the post-compact nudge that fires as the next user turn
     assert out == [
         b"\x1b[200~/compact keep API contract\x1b[201~",
         b"\r",
-        POST_COMPACT_NUDGE,
     ]
 
 
-def test_compact_nudge_is_last_chunk_in_both_forms() -> None:
-    """Regression: post-compact Claude waits idle without a follow-up nudge."""
-    from autonomous_claude import POST_COMPACT_NUDGE
+def test_compact_resume_nudge_is_scheduled_not_streamed() -> None:
+    """Regression: typing the resume nudge during compaction loses it.
 
-    bare = translate_command({"cmd": "compact"})
-    with_args = translate_command({"cmd": "compact", "instructions": "x"})
-    assert bare[-1] == POST_COMPACT_NUDGE
-    assert with_args[-1] == POST_COMPACT_NUDGE
+    The nudge must come from get_delayed_writes, NOT from
+    translate_command's immediate chunks.
+    """
+    from autonomous_claude import (
+        COMPACT_RESUME_DELAY_S,
+        POST_COMPACT_NUDGE,
+        get_delayed_writes,
+    )
+
+    # Immediate chunks must not contain the nudge bytes.
+    for payload in [{"cmd": "compact"}, {"cmd": "compact", "instructions": "x"}]:
+        joined = b"".join(translate_command(payload))
+        assert POST_COMPACT_NUDGE not in joined
+
+    # But get_delayed_writes must schedule it.
+    for payload in [{"cmd": "compact"}, {"cmd": "compact", "instructions": "x"}]:
+        delayed = get_delayed_writes(payload)
+        assert delayed == [(COMPACT_RESUME_DELAY_S, POST_COMPACT_NUDGE)]
+
+
+def test_get_delayed_writes_empty_for_non_compact() -> None:
+    from autonomous_claude import get_delayed_writes
+
+    for cmd in (
+        {"cmd": "clear"},
+        {"cmd": "exit"},
+        {"cmd": "send_keys", "data": "x"},
+    ):
+        assert get_delayed_writes(cmd) == []
 
 
 def test_compact_with_instructions_submit_is_separate_chunk() -> None:
@@ -47,8 +69,7 @@ def test_compact_with_instructions_submit_is_separate_chunk() -> None:
     paste_chunks = [c for c in out if c.startswith(b"\x1b[200~")]
     assert len(paste_chunks) == 1
     assert not paste_chunks[0].endswith(b"\r")
-    # The \r must be its own chunk, sitting between the paste and the nudge.
-    assert b"\r" in out
+    # The \r must be its own chunk immediately after the paste.
     paste_idx = out.index(paste_chunks[0])
     assert out[paste_idx + 1] == b"\r"
 
