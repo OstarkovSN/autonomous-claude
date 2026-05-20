@@ -20,6 +20,7 @@ import socket
 import struct
 import sys
 import termios
+import time
 import tty
 from pathlib import Path
 from types import FrameType
@@ -51,6 +52,14 @@ MAX_REQUEST_BYTES = 64 * 1024
 # lands in the input buffer; the TUI processes it as the next user turn once
 # compaction finishes. Plain text (no leading slash) so no autocomplete fires.
 POST_COMPACT_NUDGE = b"Context was just compacted. Resume your previous task.\r"
+
+# When `translate_command` returns multiple chunks, the dispatcher sleeps this
+# long between them. The TUI's stdin reader gets one input event per chunk
+# instead of one merged blob — necessary because Ink processes bracketed
+# paste + immediate \r as a single event, and the \r ends up as a newline
+# character in the input field instead of a submit. A human-paced gap (~tens
+# of ms) lets the paste handler settle before Enter is interpreted.
+INTER_CHUNK_DELAY_S = 0.08
 
 
 # --- low-level write helper -------------------------------------------------
@@ -91,8 +100,14 @@ def validate_send_keys(data: str) -> bool:
     return all(b in SEND_KEYS_ALLOWED for b in encoded)
 
 
-def translate_command(payload: dict[str, Any]) -> bytes:
-    """Translate a validated control message into bytes for the PTY master.
+def translate_command(payload: dict[str, Any]) -> list[bytes]:
+    """Translate a validated control message into one or more byte chunks.
+
+    The dispatcher writes each chunk to the PTY master with a brief pause
+    between consecutive chunks. Multi-chunk output is needed when Ink's
+    stdin parser would otherwise merge a paste-event and an immediately
+    following \\r into the same input event, causing the \\r to be added as
+    a newline character instead of being interpreted as submit.
 
     Raises ValueError on invalid payloads. Callers should catch and report.
     """
@@ -117,24 +132,32 @@ def translate_command(payload: dict[str, Any]) -> bytes:
             if not validate_send_keys(instructions):
                 raise ValueError("instructions contains disallowed bytes")
         if instructions is None:
-            compact_seq = b"/compact\r"
-        else:
-            # Wrap /compact + args in bracketed paste (ESC[200~ … ESC[201~).
-            # Without it, typing `/compact ` character-by-character lets the
-            # TUI's slash-command autocomplete eat the space as "confirm &
-            # submit," firing bare /compact and dumping the instructions into
-            # the next input as plain text (where \r becomes a newline, not a
-            # submit). Bracketed paste bypasses the autocomplete state machine
-            # — the TUI treats the whole thing as one pasted line.
-            body = b"/compact " + instructions.encode("utf-8")
-            compact_seq = b"\x1b[200~" + body + b"\x1b[201~\r"
-        return compact_seq + POST_COMPACT_NUDGE
+            # Bare /compact — no paste mode involved, single write is fine.
+            return [b"/compact\r", POST_COMPACT_NUDGE]
+        # Wrap /compact + args in bracketed paste (ESC[200~ … ESC[201~).
+        # Without it, typing `/compact ` character-by-character lets the
+        # TUI's slash-command autocomplete eat the space as "confirm &
+        # submit," firing bare /compact and dumping the instructions into
+        # the next input as plain text. Bracketed paste bypasses the
+        # autocomplete state machine — the TUI receives the whole thing as
+        # one pasted line.
+        #
+        # Crucially, the submit \r must be a SEPARATE write from the paste.
+        # If concatenated into the same syscall, Ink's reader processes the
+        # paste and the \r in one input event, and the \r ends up as a
+        # newline character in the input field instead of a submit.
+        body = b"/compact " + instructions.encode("utf-8")
+        return [
+            b"\x1b[200~" + body + b"\x1b[201~",
+            b"\r",
+            POST_COMPACT_NUDGE,
+        ]
 
     if cmd == "clear":
-        return b"/clear\r"
+        return [b"/clear\r"]
 
     if cmd == "exit":
-        return b"/exit\r"
+        return [b"/exit\r"]
 
     # send_keys
     data = payload.get("data")
@@ -142,7 +165,7 @@ def translate_command(payload: dict[str, Any]) -> bytes:
         raise ValueError("data must be a string")
     if not validate_send_keys(data):
         raise ValueError("data contains disallowed bytes")
-    return data.encode("utf-8")
+    return [data.encode("utf-8")]
 
 
 # --- socket lifecycle helpers -----------------------------------------------
@@ -331,24 +354,34 @@ class Wrapper:
             self._reply(conn, {"ok": False, "error": "payload must be an object"})
             return
         try:
-            keys = translate_command(payload)
+            chunks = translate_command(payload)
         except ValueError as exc:
             self._reply(conn, {"ok": False, "error": str(exc)})
             return
         if self.child is None or not self.child.isalive():
             self._reply(conn, {"ok": False, "error": "child not running"})
             return
-        try:
-            written = write_all(self.child.fd, keys)
-        except OSError as exc:
-            self._reply(conn, {"ok": False, "error": f"write failed: {exc}"})
-            return
-        if written != len(keys):
-            self._reply(
-                conn,
-                {"ok": False, "error": f"short write: {written}/{len(keys)} bytes"},
-            )
-            return
+        # Write chunks separately with a small sleep between, so the TUI's
+        # stdin reader sees them as distinct input events. See the comment on
+        # INTER_CHUNK_DELAY_S for why this matters.
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                time.sleep(INTER_CHUNK_DELAY_S)
+            try:
+                written = write_all(self.child.fd, chunk)
+            except OSError as exc:
+                self._reply(conn, {"ok": False, "error": f"write failed: {exc}"})
+                return
+            if written != len(chunk):
+                self._reply(
+                    conn,
+                    {
+                        "ok": False,
+                        "error": f"short write at chunk {i}: "
+                        f"{written}/{len(chunk)} bytes",
+                    },
+                )
+                return
         self._reply(conn, {"ok": True})
 
     # -- main loop --
